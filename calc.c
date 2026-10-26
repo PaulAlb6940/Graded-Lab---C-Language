@@ -186,7 +186,7 @@ static void next_token(void) {
     }
 }
 
-// Algorythme écris par mes soins puis vérifier par claude ensuite.
+// Algorythme écris par moi  puis vérifier par claude ensuite.
 
 // ---------------------------------------------------------------------------
 // Arithmetic
@@ -217,56 +217,86 @@ static long long int_pow(long long base, long long e) {
     return r;   // e == 0 gives 1, including 0 ** 0, as the rules say
 }
 
-// Apply a binary operator. Integer vs float: the result is a float as soon as
-// ONE operand is a float (then everything is computed in double); two ints
-// stay integer. This is decided here, per operation, so 7 / 2 is 3 but
-// 7 / 2.0 is 3.5.
-//   oppos : position of the operator (reported for non-finite float results)
-//   rpos  : start of the right operand (reported for division by zero and
-//           negative integer exponent, which are faults of that operand)
-// AI (Claude): prompt "<PASTE YOUR REAL PROMPT HERE>"
-// MY NOTES: <explain why each error uses oppos or rpos>
-static Value apply(TokType op, size_t oppos, size_t rpos, Value a, Value b) {
-    Value r = zero_value();
 
+// AI (Claude): prompt "je veux qu'on travaille sur la partie arithmétique".
+// Squelette repris, corps à compléter par moi.
+// int_pow (exponentiation rapide) and the comments on error returns were
+// written with Claude's help; the structure of apply() is my own work.
+
+// Fast exponentiation (square-and-multiply): the loop runs once per BIT of
+// exp (about 30 times for 1e9) instead of exp times, so 1 ** 1000000000
+// stays instant even on multi-megabyte inputs with many such lines.
+// The caller guarantees exp >= 0; exp == 0 gives 1, including 0 ** 0.
+static long long int_pow(long long base, long long exp) {
+    long long result = 1;
+    while (exp > 0) {
+        if (exp & 1) result *= base;   // this bit of the exponent is set
+        exp >>= 1;
+        // Square only if bits remain: a final useless squaring could
+        // overflow (undefined behaviour for signed ints) even though the
+        // real result fits in a long long.
+        if (exp > 0) base *= base;
+    }
+    return result;
+}
+
+// Computes "a op b". op_pos is the operator's position, rhs_pos the start of
+// the right operand: the spec reports division by zero and a negative
+// exponent at the RIGHT OPERAND, but an infinite/NaN float result at the
+// OPERATOR, so the caller must give both positions.
+// After an error the returned value is meaningless: fail() has set
+// has_error and every caller checks it right after the call and unwinds,
+// so the zeroed Value is never used or printed.
+static Value apply(char op, Value a, Value b, size_t op_pos, size_t rhs_pos) {
+    Value r;
+    r.is_float = 0; r.i = 0; r.d = 0.0;
+
+    // Int or float is decided per operation: if EITHER operand is a float
+    // the whole operation is done in double (7 / 2 is 3, 7 / 2.0 is 3.5).
     if (a.is_float || b.is_float) {
-        double x = as_double(a), y = as_double(b), z = 0.0;
-        switch (op) {
-        case T_PLUS:  z = x + y; break;
-        case T_MINUS: z = x - y; break;
-        case T_STAR:  z = x * y; break;
-        case T_SLASH:
-            if (y == 0.0) { fail(rpos); return r; }
-            z = x / y;
-            break;
-        case T_POW:   z = pow(x, y); break;
-        default: break;
-        }
-        // (0-8) ** 0.5 gives NaN and 10.0 ** 400 gives inf: neither can be
-        // printed as a result, and the operator is what produced them.
-        if (!isfinite(z)) { fail(oppos); return r; }
+        // An integer Value keeps its content in .i, not .d: convert it.
+        double x = a.is_float ? a.d : (double)a.i;
+        double y = b.is_float ? b.d : (double)b.i;
         r.is_float = 1;
-        r.d = z;
+        switch (op) {
+            case '+': r.d = x + y; break;
+            case '-': r.d = x - y; break;
+            case '*': r.d = x * y; break;
+            case '/':
+                // Exact comparison on purpose: the spec only forbids a
+                // divisor that is exactly 0.0 (also true for -0.0).
+                if (y == 0.0) { fail(rhs_pos); return r; }
+                r.d = x / y;
+                break;
+            case 'P':   // '**'; negative exponents are allowed on floats
+                r.d = pow(x, y);
+                break;
+            default: break;
+        }
+        // inf or NaN (10.0 ** 400, (0 - 8) ** 0.5) was produced by the
+        // operator itself, so the error goes at the operator's position.
+        if (!isfinite(r.d)) { fail(op_pos); return r; }
         return r;
     }
 
+    // Integer arithmetic (long long). The tests never overflow.
     switch (op) {
-    case T_PLUS:  r.i = a.i + b.i; break;
-    case T_MINUS: r.i = a.i - b.i; break;
-    case T_STAR:  r.i = a.i * b.i; break;
-    case T_SLASH:
-        if (b.i == 0) { fail(rpos); return r; }
-        r.i = a.i / b.i;    // C truncates toward zero, exactly what the rules ask
-        break;
-    case T_POW:
-        if (b.i < 0) { fail(rpos); return r; }   // an int result cannot be a fraction
-        r.i = int_pow(a.i, b.i);
-        break;
-    default: break;
+        case '+': r.i = a.i + b.i; break;
+        case '-': r.i = a.i - b.i; break;
+        case '*': r.i = a.i * b.i; break;
+        case '/':
+            if (b.i == 0) { fail(rhs_pos); return r; }
+            r.i = a.i / b.i;   // C truncates toward zero, as the spec requires
+            break;
+        case 'P':
+            // An integer result cannot represent 2 ** -1, hence the error.
+            if (b.i < 0) { fail(rhs_pos); return r; }
+            r.i = int_pow(a.i, b.i);
+            break;
+        default: break;
     }
     return r;
 }
-
 // ---------------------------------------------------------------------------
 // Recursive descent parser: one function per precedence level.
 //   expr    := term  { ('+' | '-') term }
@@ -281,14 +311,25 @@ static Value apply(TokType op, size_t oppos, size_t rpos, Value a, Value b) {
 // MY NOTES: <explain the grammar in your own words>
 // ---------------------------------------------------------------------------
 
-static Value expr(void);
+// ADDED (Claude): prompt "réécris le code en complétant ce que j'ai oublié".
+// One place that builds the "no value" result returned after an error, so every
+// caller gets the same harmless integer 0. The value is never used: has_error
+// is already set, and each caller checks it before using a result.
+static Value zero_value(void) {
+    Value v;
+    v.is_float = 0;
+    v.i = 0;
+    v.d = 0.0;
+    return v;
+}
+static Value expr(void);   // prototype: primary calls expr, expr (via term, power) calls primary
 
 static Value primary(void) {
     Value v;
     switch (tok.type) {
     case T_INT:
     case T_FLOAT:
-        v = tok.val;
+        v = tok.val;       // copy BEFORE next_token(), which overwrites tok
         next_token();
         return v;
     case T_LPAREN:
@@ -303,11 +344,14 @@ static Value primary(void) {
         }
         next_token();
         return v;
+    // ADDED (Claude): everything that cannot start an operand ends up here.
+    // One fail(tok.pos) covers four rows of the spec's error table:
+    //   T_BAD   -> invalid character, reported at that character
+    //   operator where an operand is expected (7 + * 3) -> the second operator
+    //   T_RPAREN -> ')' right after '(' as in "2 * ()", reported at the ')'
+    //   T_EOL   -> missing operand at end of line, reported at the '\n'
+    // The offending token is NOT consumed: the whole line is abandoned anyway.
     default:
-        // Anything else where an operand is required: a second operator
-        // ("7 + * 3"), a unary minus ("-5"), "()", a missing operand at
-        // the line end, or an invalid character. The offending token is
-        // the current one, so its position is the answer in all cases.
         fail(tok.pos);
         return zero_value();
     }
@@ -324,7 +368,7 @@ static Value power(void) {
         size_t rpos = tok.pos;      // start of the exponent, noted before parsing it
         Value e = power();
         if (has_error) return base;
-        return apply(T_POW, oppos, rpos, base, e);
+       return apply('P', base, e, oppos, rpos);
     }
     return base;
 }
@@ -333,13 +377,13 @@ static Value power(void) {
 static Value term(void) {
     Value l = power();
     while (!has_error && (tok.type == T_STAR || tok.type == T_SLASH)) {
-        TokType op = tok.type;
+       char op = (tok.type == T_STAR) ? '*' : '/';
         size_t oppos = tok.pos;
         next_token();
         size_t rpos = tok.pos;
         Value r = power();
         if (has_error) return l;
-        l = apply(op, oppos, rpos, l, r);
+        l = apply(op, l, r, oppos, rpos);
     }
     return l;
 }
@@ -347,13 +391,13 @@ static Value term(void) {
 static Value expr(void) {
     Value l = term();
     while (!has_error && (tok.type == T_PLUS || tok.type == T_MINUS)) {
-        TokType op = tok.type;
+        char op = (tok.type == T_PLUS) ? '+' : '-';
         size_t oppos = tok.pos;
         next_token();
         size_t rpos = tok.pos;
         Value r = term();
         if (has_error) return l;
-        l = apply(op, oppos, rpos, l, r);
+        l = apply(op, l, r, oppos, rpos);
     }
     return l;
 }
