@@ -111,78 +111,82 @@ static void append_value(Value v) {
 // never reset at line starts, so off + 1 is already the file-wide 1-based
 // position (newlines and comment lines included). No separate counter needed.
 // MY NOTES: <describe in your own words how positions are tracked>
+// AI (Claude): prompt "donne moi une piste pour la structure de next_token(),
+// j'essaie de la compléter moi-même". Squelette repris 
+
 static void next_token(void) {
-    // Only spaces and tabs are blanks; anything else (e.g. '\r') is an
-    // invalid character and must be reported, not skipped.
-    while (off < len && (buf[off] == ' ' || buf[off] == '\t')) off++;
+    // 1. Sauter les espaces et tabulations (mais PAS '\n' : c'est un token).
+    while (off < len && (buf[off] == ' ' || buf[off] == '\t')) {
+        off++;
+    }
 
-    tok.pos = off + 1;  // taken AFTER skipping blanks: errors point at the token itself
+    // 2. Position fixée APRÈS les blancs et AVANT de consommer le token :
+    //    off est 0-based, les positions de l'énoncé sont 1-based.
+    tok.pos = off + 1;
 
-    if (off >= len) {   // end of file without '\n': off == len gives len + 1
+    // 3. Fin du buffer : T_EOL. Quand off == len, off + 1 == len + 1,
+    //    exactement la position demandée pour un fichier sans '\n' final.
+    if (off >= len) {
         tok.type = T_EOL;
         return;
     }
 
     char c = buf[off];
 
-    if (c == '\n') {
-        tok.type = T_EOL;
-        off++;          // consumed, so the next line continues at the right offset
-        return;
-    }
-
+    // 4. Chiffres.
     if (isdigit((unsigned char)c)) {
         size_t start = off;
         long long n = 0;
-        while (isdigit((unsigned char)buf[off])) {   // buf[len] == '\0' stops the loop
+        while (isdigit((unsigned char)buf[off])) {  // buf[len] == '\0' arrête la boucle
             n = n * 10 + (buf[off] - '0');
             off++;
         }
-        // A float needs digits on BOTH sides of the dot. If not, we return the
-        // integer and leave the '.' unread: it then becomes a T_BAD token, so
-        // "5." and ".5" fail exactly at the '.', as the rules require.
+        // Flottant seulement si '.' est suivi d'un chiffre. Sinon le '.' n'est
+        // pas consommé : il devient le token suivant (T_BAD, à sa position).
+        // Pareil pour le 'e' de 1.5e3 : il reste non lu.
         if (buf[off] == '.' && isdigit((unsigned char)buf[off + 1])) {
             off++;
             while (isdigit((unsigned char)buf[off])) off++;
-            // strtod needs a '\0'-terminated string. Instead of copying the
-            // digits (slow, and numbers have no length limit) we put a '\0'
-            // in place for a moment and restore the character right after.
+            // strtod veut une chaîne terminée par '\0' : on en pose un
+            // temporairement au lieu de copier les chiffres, puis on restaure.
             char saved = buf[off];
             buf[off] = '\0';
             tok.val.d = strtod(buf + start, NULL);
             buf[off] = saved;
             tok.val.is_float = 1;
             tok.type = T_FLOAT;
-            return;
+        } else {
+            tok.val.is_float = 0;
+            tok.val.i = n;
+            tok.type = T_INT;
         }
-        tok.val.is_float = 0;
-        tok.val.i = n;
-        tok.type = T_INT;
         return;
     }
 
-    off++;
+    // 5. Opérateurs et parenthèses.
+    off++;               // on consomme le caractère
     switch (c) {
-    case '+': tok.type = T_PLUS;   break;
-    case '-': tok.type = T_MINUS;  break;
-    case '/': tok.type = T_SLASH;  break;
-    case '(': tok.type = T_LPAREN; break;
-    case ')': tok.type = T_RPAREN; break;
-    case '*':
-        // Look one character ahead: "**" must be ONE token, otherwise
-        // 2 ** 3 would be read as two multiplications.
-        if (buf[off] == '*') {
-            off++;
-            tok.type = T_POW;
-        } else {
-            tok.type = T_STAR;
-        }
-        break;
-    default:
-        tok.type = T_BAD;   // includes '#' anywhere except at the start of a line
-        break;
+        case '+': tok.type = T_PLUS;   break;
+        case '-': tok.type = T_MINUS;  break;
+        case '/': tok.type = T_SLASH;  break;
+        case '(': tok.type = T_LPAREN; break;
+        case ')': tok.type = T_RPAREN; break;
+        case '\n': tok.type = T_EOL;   break;
+        case '*':
+            // "**" doit être UN token, sinon 2 ** 3 serait lu comme deux '*'.
+            // buf[off] est sûr même en fin de buffer grâce au '\0' final.
+            if (buf[off] == '*') {
+                off++;
+                tok.type = T_POW;
+            } else {
+                tok.type = T_STAR;
+            }
+            break;
+        default:  tok.type = T_BAD;  break;   // y compris '#' ici
     }
 }
+
+// Algorythme écris par mes soins puis vérifier par claude ensuite.
 
 // ---------------------------------------------------------------------------
 // Arithmetic
