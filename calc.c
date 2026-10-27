@@ -402,6 +402,87 @@ static Value expr(void) {
     return l;
 }
 
+
+// AI (Claude): prompt "<TON VRAI PROMPT>" Link: <lien>
+//   Écrit par Claude, repris tel quel : <ce que tu as modifié ou compris>.
+
+// Ajoute n octets à out. La capacité double quand elle est pleine : N ajouts
+// coûtent O(N) au total, au lieu de recopier tout le tampon à chaque ligne.
+static void out_append(const char *s, size_t n) {
+    if (out_len + n > out_cap) {
+        size_t cap = out_cap ? out_cap : 4096;
+        while (cap < out_len + n) cap *= 2;
+        char *p = realloc(out, cap);
+        if (!p) { fprintf(stderr, "calc: out of memory\n"); exit(1); }
+        out = p;
+        out_cap = cap;
+    }
+    memcpy(out + out_len, s, n);
+    out_len += n;
+}
+
+// Formate dans un petit tableau local (snprintf ne dépasse jamais sa taille),
+// puis recopie dans out. %lld pour un entier, %.15g pour un flottant.
+static void append_value(Value v) {
+    char tmp[64];
+    int n = v.is_float ? snprintf(tmp, sizeof tmp, "%.15g\n", v.d)
+                       : snprintf(tmp, sizeof tmp, "%lld\n", v.i);
+    out_append(tmp, (size_t)n);
+}
+
+// Lit tout le fichier d'un coup : taille via fseek/ftell, un seul fread.
+// Le buffer a len + 1 octets : le '\0' final est indispensable, le tokenizer
+// lit buf[off] et buf[off + 1] sans tester len, et strtod veut une fin de chaîne.
+static char *read_file(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "calc: cannot open '%s': %s\n", path, strerror(errno));
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long size = ftell(f);
+    if (size < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    char *b = malloc((size_t)size + 1);
+    if (!b) {
+        fclose(f);
+        fprintf(stderr, "calc: out of memory\n");
+        return NULL;
+    }
+    size_t got = fread(b, 1, (size_t)size, f);
+    fclose(f);
+    if (got != (size_t)size) {
+        free(b);
+        fprintf(stderr, "calc: error reading '%s'\n", path);
+        return NULL;
+    }
+    b[got] = '\0';
+    *n = got;
+    return b;
+}
+
+// Écrit le résultat. Une erreur remplace tout : ERROR:<pos> seul, aucun
+// résultat partiel, car out n'est écrit que si has_error vaut 0.
+static int write_results(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "calc: cannot write '%s': %s\n", path, strerror(errno));
+        return 1;
+    }
+    int rc = 0;
+    if (has_error) {
+        if (fprintf(f, "ERROR:%zu\n", err_pos) < 0) rc = 1;
+    } else if (out_len > 0 && fwrite(out, 1, out_len, f) != out_len) {
+        rc = 1;
+    }
+    if (fclose(f) != 0) rc = 1;
+    if (rc) fprintf(stderr, "calc: error writing '%s'\n", path);
+    return rc;
+}
+
+
+
+
+
 // Evaluate the whole buffer line by line. Stops at the first error.
 static void evaluate_all(void) {
     has_error = 0;
@@ -441,6 +522,14 @@ static void evaluate_all(void) {
 // each chunk), so multi-megabyte files are read in a handful of reallocs.
 // AI (Claude): prompt "<PASTE YOUR REAL PROMPT HERE>"
 // MY NOTES: <say which part of the loop is yours>
+// read_file : réécrite avec fseek/ftell (suggestion de Claude, adaptée).
+// base_name, process_file, main : réécrites avec snprintf et des if simples
+// (plus de malloc/free pour les chemins). Ancienne version : calc_old.c.
+
+#define PATH_MAX_LEN 512
+
+// Lit tout le fichier en mémoire, terminé par '\0'.
+// Retourne NULL en cas d'erreur (message déjà affiché sur stderr).
 static char *read_file(const char *path, size_t *n) {
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -451,34 +540,30 @@ static char *read_file(const char *path, size_t *n) {
         fprintf(stderr, "calc: '%s' is a directory, not a file\n", path);
         return NULL;
     }
+
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "calc: cannot open '%s': %s\n", path, strerror(errno));
         return NULL;
     }
-    size_t cap = 1 << 16, used = 0;
-    char *b = malloc(cap);
-    if (!b) {
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    rewind(f);
+    if (size < 0) {
+        fprintf(stderr, "calc: cannot read '%s'\n", path);
         fclose(f);
-        fprintf(stderr, "calc: out of memory\n");
         return NULL;
     }
-    for (;;) {
-        if (used + 1 >= cap) {          // keep one byte free for the final '\0'
-            cap *= 2;
-            char *p = realloc(b, cap);
-            if (!p) {
-                free(b);
-                fclose(f);
-                fprintf(stderr, "calc: out of memory\n");
-                return NULL;
-            }
-            b = p;
-        }
-        size_t r = fread(b + used, 1, cap - used - 1, f);
-        if (r == 0) break;
-        used += r;
+
+    char *b = malloc(size + 1);
+    if (!b) {
+        fprintf(stderr, "calc: out of memory\n");
+        fclose(f);
+        return NULL;
     }
+
+    size_t r = fread(b, 1, size, f);
     if (ferror(f)) {
         fprintf(stderr, "calc: error reading '%s'\n", path);
         free(b);
@@ -486,73 +571,46 @@ static char *read_file(const char *path, size_t *n) {
         return NULL;
     }
     fclose(f);
-    b[used] = '\0';
-    *n = used;
+
+    b[r] = '\0';
+    *n = r;
     return b;
 }
 
-// "dir/task1.txt" -> "task1", "labs/" -> "labs". Malloc'd.
-static char *base_name(const char *path) {
-    size_t end = strlen(path);
-    while (end > 1 && path[end - 1] == '/') end--;
-    size_t start = end;
-    while (start > 0 && path[start - 1] != '/') start--;
-    size_t n = end - start;
-    if (n > 4 && strcmp(path + end - 4, ".txt") == 0) n -= 4;
-    char *s = malloc(n + 1);
-    if (!s) {
-        fprintf(stderr, "calc: out of memory\n");
-        exit(1);
+// "dir/task1.txt" -> "task1", "labs/" -> "labs". Résultat écrit dans dst.
+static void base_name(const char *path, char *dst, size_t cap) {
+    char tmp[PATH_MAX_LEN];
+    snprintf(tmp, sizeof tmp, "%s", path);
+
+    // enlever les '/' de fin ("labs/" -> "labs")
+    size_t end = strlen(tmp);
+    while (end > 1 && tmp[end - 1] == '/') {
+        tmp[end - 1] = '\0';
+        end--;
     }
-    memcpy(s, path + start, n);
-    s[n] = '\0';
-    return s;
+
+    // garder ce qui suit le dernier '/'
+    char *slash = strrchr(tmp, '/');
+    char *name = slash ? slash + 1 : tmp;
+
+    // enlever ".txt" à la fin
+    size_t n = strlen(name);
+    if (n > 4 && strcmp(name + n - 4, ".txt") == 0) n -= 4;
+
+    snprintf(dst, cap, "%.*s", (int)n, name);
 }
 
-// base + suffix, malloc'd.
-static char *concat(const char *a, const char *b) {
-    size_t la = strlen(a), lb = strlen(b);
-    char *s = malloc(la + lb + 1);
-    if (!s) {
-        fprintf(stderr, "calc: out of memory\n");
-        exit(1);
-    }
-    memcpy(s, a, la);
-    memcpy(s + la, b, lb + 1);
-    return s;
-}
-
-// dir + "/" + name, malloc'd.
-static char *join_path(const char *dir, const char *name) {
-    size_t la = strlen(dir), lb = strlen(name);
-    char *s = malloc(la + lb + 2);
-    if (!s) {
-        fprintf(stderr, "calc: out of memory\n");
-        exit(1);
-    }
-    memcpy(s, dir, la);
-    s[la] = '/';
-    memcpy(s + la + 1, name, lb + 1);
-    return s;
-}
-
-// Create the output folder if needed (its parent exists); reuse it otherwise.
+// Crée le dossier de sortie s'il n'existe pas. Retourne 0 si OK.
 static int make_outdir(const char *d) {
-    struct stat st;
-    if (stat(d, &st) == 0) {
-        if (S_ISDIR(st.st_mode)) return 0;
-        fprintf(stderr, "calc: '%s' exists and is not a folder\n", d);
-        return 1;
-    }
-    if (mkdir(d, 0777) != 0) {
+    if (mkdir(d, 0777) != 0 && errno != EEXIST) {
         fprintf(stderr, "calc: cannot create folder '%s': %s\n", d, strerror(errno));
         return 1;
     }
     return 0;
 }
 
-// Evaluate one input file and write its output file. Returns 0 on success.
-// A result of ERROR:<pos> is NOT a failure here (exit code stays 0).
+// Évalue un fichier d'entrée et écrit son fichier de sortie. Retourne 0 si OK.
+// Un résultat ERROR:<pos> n'est PAS un échec ici (le code de retour reste 0).
 static int process_file(const char *in_path, const char *base, const char *outdir) {
     size_t n = 0;
     char *data = read_file(in_path, &n);
@@ -562,91 +620,83 @@ static int process_file(const char *in_path, const char *base, const char *outdi
     len = n;
     evaluate_all();
 
-    // Created only after the input was read, so a missing input leaves no
-    // empty folder behind.
+    // Dossier créé seulement après la lecture : une entrée absente
+    // ne laisse pas de dossier vide.
     if (make_outdir(outdir) != 0) {
         free(data);
+        buf = NULL;
         return 1;
     }
 
-    char *name = concat(base, FILE_SUFFIX);
-    char *path = join_path(outdir, name);
-    FILE *f = fopen(path, "wb");
+    char path[PATH_MAX_LEN];
+    snprintf(path, sizeof path, "%s/%s%s", outdir, base, FILE_SUFFIX);
+
     int rc = 0;
+    FILE *f = fopen(path, "wb");
     if (!f) {
         fprintf(stderr, "calc: cannot write '%s': %s\n", path, strerror(errno));
         rc = 1;
     } else {
         if (has_error) {
-            char msg[64];
-            int m = snprintf(msg, sizeof msg, "ERROR:%zu\n", err_pos);
-            if (fwrite(msg, 1, (size_t)m, f) != (size_t)m) rc = 1;
-        } else if (out_len > 0 && fwrite(out, 1, out_len, f) != out_len) {
+            fprintf(f, "ERROR:%zu\n", err_pos);
+        } else if (out_len > 0) {
+            fwrite(out, 1, out_len, f);
+        }
+        if (fclose(f) != 0) {
+            fprintf(stderr, "calc: error writing '%s'\n", path);
             rc = 1;
         }
-        if (fclose(f) != 0) rc = 1;
-        if (rc) fprintf(stderr, "calc: error writing '%s'\n", path);
     }
-    free(path);
-    free(name);
+
     free(data);
     buf = NULL;
     return rc;
-}
-
-static int usage(void) {
-    fprintf(stderr,
-            "usage: calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]\n");
-    return 2;
 }
 
 int main(int argc, char **argv) {
     const char *dir = NULL, *outdir = NULL, *input = NULL;
 
     for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        if (strcmp(a, "-d") == 0 || strcmp(a, "--dir") == 0) {
-            if (++i >= argc) {
-                fprintf(stderr, "calc: option '%s' needs a value\n", a);
-                return usage();
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "calc: option '%s' needs a value\n", argv[i]);
+                return 1;
             }
-            dir = argv[i];
-        } else if (strcmp(a, "-o") == 0 || strcmp(a, "--output-dir") == 0) {
-            if (++i >= argc) {
-                fprintf(stderr, "calc: option '%s' needs a value\n", a);
-                return usage();
+            dir = argv[++i];
+        } else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output-dir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "calc: option '%s' needs a value\n", argv[i]);
+                return 1;
             }
-            outdir = argv[i];
-        } else if (a[0] == '-' && a[1] != '\0') {
-            fprintf(stderr, "calc: unknown option '%s'\n", a);
-            return usage();
+            outdir = argv[++i];
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            fprintf(stderr, "calc: unknown option '%s'\n", argv[i]);
+            return 1;
+        } else if (input) {
+            fprintf(stderr, "calc: more than one input file\n");
+            return 1;
         } else {
-            if (input) {
-                fprintf(stderr, "calc: more than one input file\n");
-                return usage();
-            }
-            input = a;
+            input = argv[i];
         }
     }
 
-    // Exactly one of: an input file, or -d DIR.
+    // Exactement un des deux : un fichier d'entrée, ou -d DIR.
     if ((dir == NULL) == (input == NULL)) {
-        fprintf(stderr, "calc: give either one input file or -d DIR\n");
-        return usage();
+        fprintf(stderr, "usage: calc [-d DIR] [-o OUTDIR] [input.txt]\n");
+        return 1;
     }
 
+    char base[PATH_MAX_LEN];
+    char default_out[PATH_MAX_LEN];
     int rc = 0;
 
     if (input) {
-        char *base = base_name(input);
-        char *default_out = NULL;
+        base_name(input, base, sizeof base);
         if (!outdir) {
-            default_out = concat(base, DIR_SUFFIX);
+            snprintf(default_out, sizeof default_out, "%s%s", base, DIR_SUFFIX);
             outdir = default_out;
         }
         rc = process_file(input, base, outdir);
-        free(default_out);
-        free(base);
     } else {
         DIR *d = opendir(dir);
         if (!d) {
@@ -654,31 +704,31 @@ int main(int argc, char **argv) {
             free(out);
             return 1;
         }
-        char *dbase = base_name(dir);
-        char *default_out = NULL;
+        base_name(dir, base, sizeof base);
         if (!outdir) {
-            default_out = concat(dbase, DIR_SUFFIX);
+            snprintf(default_out, sizeof default_out, "%s%s", base, DIR_SUFFIX);
             outdir = default_out;
         }
         rc = make_outdir(outdir);
+
         struct dirent *e;
         while (rc == 0 && (e = readdir(d)) != NULL) {
             size_t n = strlen(e->d_name);
-            // Only "*.txt" files directly inside DIR; subfolders (even named
-            // x.txt) and other files are ignored.
+            // Seulement les "*.txt" directement dans DIR ; sous-dossiers
+            // (même nommés x.txt) et autres fichiers ignorés.
             if (n <= 4 || strcmp(e->d_name + n - 4, ".txt") != 0) continue;
-            char *p = join_path(dir, e->d_name);
+
+            char p[PATH_MAX_LEN];
+            snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+
             struct stat st;
             if (stat(p, &st) == 0 && S_ISREG(st.st_mode)) {
-                char *b = base_name(e->d_name);
+                char b[PATH_MAX_LEN];
+                base_name(e->d_name, b, sizeof b);
                 if (process_file(p, b, outdir) != 0) rc = 1;
-                free(b);
             }
-            free(p);
         }
         closedir(d);
-        free(default_out);
-        free(dbase);
     }
 
     free(out);
